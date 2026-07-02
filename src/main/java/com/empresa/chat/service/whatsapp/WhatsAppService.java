@@ -89,12 +89,35 @@ public class WhatsAppService {
     /**
      * A API oficial da Meta espera o número em formato E.164 sem "+" e sem sufixo
      * (ex: "5511999999999"), diferente do JID usado pela Evolution API.
+     *
+     * Números de celular brasileiros recebidos via webhook às vezes vêm SEM o
+     * "nono dígito" (formato antigo, ex: 5547989299801 -> 554789299801), mesmo
+     * quando o cadastro na Meta/contato usa o formato novo. Aqui reinserimos
+     * esse dígito quando necessário, para bater com o destino esperado.
      */
     private String normalizarDestino(String telefone) {
         if (telefone == null) return "";
         String numero = telefone.replaceAll("[^0-9]", "");
-        if (!numero.startsWith("55")) numero = "55" + numero;
-        return numero;
+
+        if (!numero.startsWith("55")) {
+            numero = "55" + numero;
+        }
+
+        // Formato esperado: 55 + DDD(2 dígitos) + assinante(8 ou 9 dígitos)
+        if (numero.length() < 12) {
+            // Número curto demais para aplicar a regra com segurança — retorna como está
+            return numero;
+        }
+
+        String ddd = numero.substring(2, 4);
+        String assinante = numero.substring(4);
+
+        // Celular sem o nono dígito: 8 dígitos, começando em 6-9 (padrão de celular no Brasil)
+        if (assinante.length() == 8 && assinante.matches("^[6-9].*")) {
+            assinante = "9" + assinante;
+        }
+
+        return "55" + ddd + assinante;
     }
 
     private HttpHeaders headersJson() {
