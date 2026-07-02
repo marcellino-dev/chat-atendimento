@@ -41,10 +41,12 @@ app:
     refresh-expiration: 604800000
   websocket:
     allowed-origins: http://localhost:3000
-  evolution:
-    base-url: http://localhost:8081
-    api-key: tx6cg14quocf1giq0badws
-    instance: atendimento
+  whatsapp:
+    graph-api-url: https://graph.facebook.com
+    api-version: v21.0
+    phone-number-id: ${WHATSAPP_PHONE_NUMBER_ID}
+    access-token: ${WHATSAPP_TOKEN}
+    verify-token: ${WHATSAPP_VERIFY_TOKEN:meuTokenSecretoWebhook123}
 
 logging:
   level:

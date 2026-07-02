@@ -8,11 +8,11 @@ import com.empresa.chat.repository.SetorRepository;
 import com.empresa.chat.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 @Service
 @RequiredArgsConstructor
@@ -22,175 +22,232 @@ public class BotService {
     private final AtendenteRepository atendenteRepository;
     private final SetorRepository setorRepository;
     private final UserRepository userRepository;
+    private final StringRedisTemplate redisTemplate;
 
-    private final Map<String, Integer> etapaCliente = new ConcurrentHashMap<>();
-    private final Map<String, Long> setorIdEscolhido = new ConcurrentHashMap<>();
-    private final Map<String, String> ultimaMensagemCliente = new ConcurrentHashMap<>();
-    private final Map<String, Boolean> atendimentoFinalizado = new ConcurrentHashMap<>();
+    // ── Prefixos Redis ──────────────────────────────────────────────────────
+    // Estado do fluxo do bot por cliente (TTL 1 hora de inatividade)
+    private static final String PREFIX_ETAPA        = "bot:etapa:";
+    private static final String PREFIX_SETOR        = "bot:setor:";
+    private static final String PREFIX_ULTIMA_MSG   = "bot:ultimamsg:";
+    private static final String PREFIX_FINALIZADO   = "bot:finalizado:";
 
-    public String processarMensagem(String telefone, String nome, String mensagem) {
-        // Se o atendimento já foi finalizado, ignora novas mensagens
-        if (atendimentoFinalizado.getOrDefault(telefone, false)) {
-            log.info("Atendimento já finalizado para: {}", telefone);
-            return null;
+    private static final Duration TTL_SESSAO        = Duration.ofHours(1);
+    private static final Duration TTL_FINALIZADO    = Duration.ofHours(24);
+
+    // =========================================================================
+    // ENTRADA PRINCIPAL
+    // =========================================================================
+
+    /**
+     * Processa a mensagem do cliente e retorna a resposta do bot,
+     * ou "em_atendimento" se o cliente já foi encaminhado para um atendente,
+     * ou null se a mensagem deve ser ignorada.
+     */
+    public String processarMensagem(String jid, String nome, String mensagem) {
+
+        // Atendimento já encerrado — bot não interfere mais
+        if (Boolean.parseBoolean(redisTemplate.opsForValue().get(PREFIX_FINALIZADO + jid))) {
+            log.debug("Bot inativo para {} (atendimento finalizado)", jid);
+            return "em_atendimento";
         }
 
-        Integer etapa = etapaCliente.getOrDefault(telefone, 0);
         String msgLower = mensagem.toLowerCase().trim();
 
-        // Verifica se é a mesma mensagem repetida (evita duplicação)
-        String ultimaMsg = ultimaMensagemCliente.get(telefone);
+        // Deduplicação: evita processar a mesma mensagem duas vezes seguidas
+        String ultimaMsg = redisTemplate.opsForValue().get(PREFIX_ULTIMA_MSG + jid);
         if (mensagem.equals(ultimaMsg)) {
-            log.info("Mensagem repetida ignorada: {}", mensagem);
+            log.debug("Mensagem repetida ignorada para {}", jid);
             return null;
         }
-        ultimaMensagemCliente.put(telefone, mensagem);
+        redisTemplate.opsForValue().set(PREFIX_ULTIMA_MSG + jid, mensagem, TTL_SESSAO);
 
-        log.info("Bot - Cliente: {} | Etapa: {} | Msg: {}", telefone, etapa, mensagem);
+        int etapa = getEtapa(jid);
+        log.info("🤖 Bot | jid={} | etapa={} | msg={}", jid, etapa, mensagem);
 
-        // Comandos especiais
+        // Comandos globais de reset
         if (msgLower.equals("menu") || msgLower.equals("sair") || msgLower.equals("0")) {
-            etapaCliente.remove(telefone);
-            setorIdEscolhido.remove(telefone);
-            ultimaMensagemCliente.remove(telefone);
-            atendimentoFinalizado.remove(telefone);
+            resetar(jid);
             return menuPrincipal(nome);
         }
 
-        // Etapa 0: Primeira mensagem (boas-vindas)
-        if (etapa == 0) {
-            etapaCliente.put(telefone, 1);
-            return menuPrincipal(nome);
-        }
-
-        // Etapa 1: Aguardando escolha do setor (1-5)
-        if (etapa == 1) {
-            Long setorId = mapearOpcaoSetor(mensagem);
-
-            if (setorId == null) {
-                return "❌ Opção inválida! Digite um número de 1 a 5.\n\n" + menuPrincipal(nome);
+        return switch (etapa) {
+            case 0 -> {
+                setEtapa(jid, 1);
+                yield menuPrincipal(nome);
             }
-
-            Setor setor = setorRepository.findById(setorId).orElse(null);
-            if (setor == null || !setor.getAtivo()) {
-                return "❌ Setor não encontrado.\n\n" + menuPrincipal(nome);
-            }
-
-            setorIdEscolhido.put(telefone, setorId);
-            etapaCliente.put(telefone, 2);
-
-            List<Atendente> atendentes = atendenteRepository.findBySetorIdAndStatus(setorId, StatusAtendente.ONLINE);
-
-            if (atendentes.isEmpty()) {
-                etapaCliente.put(telefone, 1);
-                return "⚠️ Nenhum atendente disponível para *" + setor.getNome() +
-                        "* no momento.\n\nDigite outro número ou *MENU* para voltar.";
-            }
-
-            return listaAtendentes(atendentes, setor.getNome());
-        }
-
-        // Etapa 2: Aguardando escolha do atendente (1-N)
-        if (etapa == 2) {
-            try {
-                int opcao = Integer.parseInt(mensagem.trim());
-                Long setorId = setorIdEscolhido.get(telefone);
-
-                if (setorId == null) {
-                    log.error("SetorId não encontrado para cliente: {}", telefone);
-                    etapaCliente.put(telefone, 1);
-                    return menuPrincipal(nome);
-                }
-
-                List<Atendente> atendentes = atendenteRepository.findBySetorIdAndStatus(setorId, StatusAtendente.ONLINE);
-
-                if (opcao < 1 || opcao > atendentes.size()) {
-                    Setor setor = setorRepository.findById(setorId).orElse(null);
-                    return "❌ Opção inválida! Escolha um número entre 1 e " + atendentes.size() + ".\n\n" +
-                            listaAtendentes(atendentes, setor != null ? setor.getNome() : "setor");
-                }
-
-                Atendente atendente = atendentes.get(opcao - 1);
-                Setor setor = setorRepository.findById(setorId).orElse(null);
-
-                String nomeAtendente = userRepository.findById(atendente.getUser().getId())
-                        .map(u -> u.getNome())
-                        .orElse("Atendente");
-
-                // Marca o atendimento como finalizado para não responder mais
-                atendimentoFinalizado.put(telefone, true);
-
-                // Limpa o estado da conversa
-                etapaCliente.remove(telefone);
-                setorIdEscolhido.remove(telefone);
-                ultimaMensagemCliente.remove(telefone);
-
-                return "✅ Você será atendido por *" + nomeAtendente +
-                        "* do setor *" + (setor != null ? setor.getNome() : "") + "*.\n\n" +
-                        "Aguarde, o atendente irá responder em breve.\n\n" +
-                        "Digite *MENU* para reiniciar o atendimento.";
-
-            } catch (NumberFormatException e) {
-                Long setorId = setorIdEscolhido.get(telefone);
-                if (setorId == null) {
-                    etapaCliente.put(telefone, 1);
-                    return "❌ Por favor, digite o número do setor desejado (1 a 5).\n\n" + menuPrincipal(nome);
-                }
-                List<Atendente> atendentes = atendenteRepository.findBySetorIdAndStatus(setorId, StatusAtendente.ONLINE);
-                Setor setor = setorRepository.findById(setorId).orElse(null);
-                return "❌ Digite apenas o NÚMERO do atendente.\n\n" +
-                        listaAtendentes(atendentes, setor != null ? setor.getNome() : "setor");
-            }
-        }
-
-        return "em_atendimento";
+            case 1 -> processarEscolhaSetor(jid, nome, mensagem);
+            case 2 -> processarEscolhaAtendente(jid, nome, mensagem);
+            default -> "em_atendimento";
+        };
     }
 
+    // =========================================================================
+    // ETAPAS DO FLUXO
+    // =========================================================================
+
+    private String processarEscolhaSetor(String jid, String nome, String mensagem) {
+        List<Setor> setores = setorRepository.findByAtivoTrue();
+        Long setorId = mapearOpcao(mensagem.trim(), setores.size());
+
+        if (setorId == null) {
+            return "❌ Opção inválida! Digite um número de *1 a " + setores.size() + "*.\n\n"
+                    + menuPrincipal(nome);
+        }
+
+        Setor setor = setorRepository.findById(setorId).orElse(null);
+        if (setor == null || !setor.getAtivo()) {
+            return "❌ Setor não encontrado.\n\n" + menuPrincipal(nome);
+        }
+
+        List<Atendente> atendentes = atendenteRepository.findBySetorIdAndStatus(
+                setorId, StatusAtendente.ONLINE);
+
+        if (atendentes.isEmpty()) {
+            return "⚠️ Nenhum atendente disponível para *" + setor.getNome() + "* no momento.\n\n"
+                    + "Digite outro número ou *MENU* para voltar.";
+        }
+
+        setSetorEscolhido(jid, setorId);
+        setEtapa(jid, 2);
+        return listaAtendentes(atendentes, setor.getNome());
+    }
+
+    private String processarEscolhaAtendente(String jid, String nome, String mensagem) {
+        Long setorId = getSetorEscolhido(jid);
+        if (setorId == null) {
+            resetar(jid);
+            return menuPrincipal(nome);
+        }
+
+        List<Atendente> atendentes = atendenteRepository.findBySetorIdAndStatus(
+                setorId, StatusAtendente.ONLINE);
+
+        int opcao;
+        try {
+            opcao = Integer.parseInt(mensagem.trim());
+        } catch (NumberFormatException e) {
+            Setor setor = setorRepository.findById(setorId).orElse(null);
+            return "❌ Digite apenas o *número* do atendente.\n\n"
+                    + listaAtendentes(atendentes, setor != null ? setor.getNome() : "setor");
+        }
+
+        if (opcao < 1 || opcao > atendentes.size()) {
+            Setor setor = setorRepository.findById(setorId).orElse(null);
+            return "❌ Opção inválida! Escolha entre 1 e " + atendentes.size() + ".\n\n"
+                    + listaAtendentes(atendentes, setor != null ? setor.getNome() : "setor");
+        }
+
+        Atendente atendente = atendentes.get(opcao - 1);
+        String nomeAtendente = userRepository.findById(atendente.getUser().getId())
+                .map(u -> u.getNome())
+                .orElse("Atendente");
+
+        Setor setor = setorRepository.findById(setorId).orElse(null);
+        String nomeSetor = setor != null ? setor.getNome() : "";
+
+        // Marca atendimento finalizado (bot para de responder)
+        redisTemplate.opsForValue().set(PREFIX_FINALIZADO + jid, "true", TTL_FINALIZADO);
+        resetar(jid);
+
+        log.info("✅ Bot encaminhou {} para atendente {} / setor {}", jid, nomeAtendente, nomeSetor);
+
+        return "✅ Você será atendido por *" + nomeAtendente + "* do setor *" + nomeSetor + "*.\n\n"
+                + "⏳ Aguarde, o atendente irá responder em breve.\n\n"
+                + "Digite *MENU* a qualquer momento para reiniciar.";
+    }
+
+    // =========================================================================
+    // MENSAGENS DO BOT
+    // =========================================================================
+
     private String menuPrincipal(String nome) {
-        return "👋 Olá, *" + nome + "!* Bem-vindo ao nosso atendimento.\n\n" +
-                "Escolha uma opção:\n\n" +
-                "1️⃣ - Financeiro\n" +
-                "2️⃣ - Suporte Técnico\n" +
-                "3️⃣ - Comercial\n" +
-                "4️⃣ - Outros\n" +
-                "5️⃣ - Certificados\n\n" +
-                "📌 Digite o *NÚMERO* da opção desejada.\n" +
-                "🔁 Digite *MENU* para voltar.";
+        List<Setor> setores = setorRepository.findByAtivoTrue();
+        StringBuilder sb = new StringBuilder();
+        sb.append("👋 Olá, *").append(nome).append("!* Bem-vindo ao atendimento.\n\n");
+        sb.append("Escolha uma opção:\n\n");
+        for (int i = 0; i < setores.size(); i++) {
+            sb.append("*").append(i + 1).append("* - ").append(setores.get(i).getNome()).append("\n");
+        }
+        sb.append("\n📌 Digite o *número* da opção desejada.\n");
+        sb.append("🔁 Digite *MENU* para reiniciar.");
+        return sb.toString();
     }
 
     private String listaAtendentes(List<Atendente> atendentes, String nomeSetor) {
         StringBuilder sb = new StringBuilder();
         sb.append("📋 *Atendentes disponíveis - ").append(nomeSetor).append("*\n\n");
-
         for (int i = 0; i < atendentes.size(); i++) {
-            Atendente a = atendentes.get(i);
-            String nome = userRepository.findById(a.getUser().getId())
-                    .map(u -> u.getNome())
-                    .orElse("Atendente");
-            sb.append(i + 1).append(" - *").append(nome).append("*\n");
+            String nomeAt = userRepository.findById(atendentes.get(i).getUser().getId())
+                    .map(u -> u.getNome()).orElse("Atendente");
+            sb.append("*").append(i + 1).append("* - ").append(nomeAt).append("\n");
         }
-
-        sb.append("\n📌 Digite o *NÚMERO* do atendente desejado.\n");
+        sb.append("\n📌 Digite o *número* do atendente.\n");
         sb.append("🔁 Digite *MENU* para voltar.");
-
         return sb.toString();
     }
 
-    private Long mapearOpcaoSetor(String opcao) {
-        String opcaoLimpa = opcao.trim();
-        switch (opcaoLimpa) {
-            case "1":
-                return 1L;
-            case "2":
-                return 2L;
-            case "3":
-                return 3L;
-            case "4":
-                return 4L;
-            case "5":
-                return 5L;
-            default:
-                return null;
+    // =========================================================================
+    // HELPERS REDIS
+    // =========================================================================
+
+    private int getEtapa(String jid) {
+        String val = redisTemplate.opsForValue().get(PREFIX_ETAPA + jid);
+        if (val == null) return 0;
+        try { return Integer.parseInt(val); } catch (NumberFormatException e) { return 0; }
+    }
+
+    private void setEtapa(String jid, int etapa) {
+        redisTemplate.opsForValue().set(PREFIX_ETAPA + jid, String.valueOf(etapa), TTL_SESSAO);
+    }
+
+    private Long getSetorEscolhido(String jid) {
+        String val = redisTemplate.opsForValue().get(PREFIX_SETOR + jid);
+        if (val == null) return null;
+        try { return Long.parseLong(val); } catch (NumberFormatException e) { return null; }
+    }
+
+    private void setSetorEscolhido(String jid, Long setorId) {
+        redisTemplate.opsForValue().set(PREFIX_SETOR + jid, String.valueOf(setorId), TTL_SESSAO);
+    }
+
+    private void resetar(String jid) {
+        redisTemplate.delete(List.of(
+                PREFIX_ETAPA      + jid,
+                PREFIX_SETOR      + jid,
+                PREFIX_ULTIMA_MSG + jid
+        ));
+    }
+
+    /**
+     * Mapeia a opção digitada (ex: "2") para o ID do item na posição correspondente.
+     * Retorna null se fora do range ou não numérico.
+     */
+    private Long mapearOpcao(String opcao, int totalItens) {
+        try {
+            int num = Integer.parseInt(opcao);
+            if (num < 1 || num > totalItens) return null;
+            List<Setor> setores = setorRepository.findByAtivoTrue();
+            if (num > setores.size()) return null;
+            return setores.get(num - 1).getId();
+        } catch (NumberFormatException e) {
+            return null;
         }
+    }
+
+    // =========================================================================
+    // API PÚBLICA — permite que outros serviços reativem o bot (ex: ao encerrar
+    // conversa pelo painel, o atendente pode "liberar" o cliente para o bot)
+    // =========================================================================
+
+    /** Reativa o bot para o cliente (ex: atendente encerrou o atendimento) */
+    public void reativarBot(String jid) {
+        redisTemplate.delete(PREFIX_FINALIZADO + jid);
+        resetar(jid);
+        log.info("🔁 Bot reativado para: {}", jid);
+    }
+
+    /** Verifica se o bot está ativo para o cliente */
+    public boolean isBotAtivo(String jid) {
+        return !Boolean.parseBoolean(redisTemplate.opsForValue().get(PREFIX_FINALIZADO + jid));
     }
 }

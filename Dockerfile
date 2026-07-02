@@ -1,16 +1,31 @@
-# ---- Build stage ----
-FROM eclipse-temurin:21-jdk-alpine AS build
-WORKDIR /app
-COPY pom.xml .
-COPY src ./src
-RUN --mount=type=cache,target=/root/.m2 \
-    ./mvnw -q clean package -DskipTests 2>/dev/null || \
-    (apt-get install -y maven 2>/dev/null || apk add --no-cache maven) && \
-    mvn -q clean package -DskipTests
+FROM openjdk:21-jdk-slim AS build
 
-# ---- Run stage ----
-FROM eclipse-temurin:21-jre-alpine
 WORKDIR /app
+
+# Copia o Maven wrapper e o pom.xml
+COPY mvnw .
+COPY .mvn .mvn
+COPY pom.xml .
+
+# Baixa as dependências
+RUN ./mvnw dependency:go-offline
+
+# Copia o código fonte
+COPY src src
+
+# Compila o projeto
+RUN ./mvnw package -DskipTests
+
+# Segunda etapa - imagem leve para execução
+FROM openjdk:21-jre-slim
+
+WORKDIR /app
+
+# Copia o JAR da etapa de build
 COPY --from=build /app/target/*.jar app.jar
+
+# Expõe a porta
 EXPOSE 8080
+
+# Comando para executar a aplicação
 ENTRYPOINT ["java", "-jar", "app.jar"]

@@ -1,209 +1,144 @@
 package com.empresa.chat.controller;
 
 import com.empresa.chat.service.bot.BotService;
-import com.empresa.chat.service.whatsapp.WhatsAppService;
 import com.empresa.chat.service.whatsapp.WhatsAppMessageService;
+import com.empresa.chat.service.whatsapp.WhatsAppService;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.ResponseEntity;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.Duration;
+import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 @RestController
 @RequestMapping("/whatsapp")
 @RequiredArgsConstructor
 @Slf4j
-@Tag(name = "WhatsApp", description = "Webhook e integração Evolution API")
+@Tag(name = "WhatsApp", description = "Webhook e integração API oficial (Meta Cloud API)")
 public class WhatsAppController {
 
     private final BotService botService;
     private final WhatsAppService whatsAppService;
     private final WhatsAppMessageService whatsAppMessageService;
     private final SimpMessagingTemplate messagingTemplate;
+    private final StringRedisTemplate redisTemplate;
 
-    private final String NUMERO_EMPRESA = "554789299801";
-    private final String NUMERO_CLIENTE_TESTE = "5591991552191";
-    private final Map<String, Long> ultimaMensagemTempo = new ConcurrentHashMap<>();
-    private final Map<String, String> ultimoMessageId = new ConcurrentHashMap<>();
+    @Value("${app.whatsapp.verify-token}")
+    private String verifyToken;
 
+    private static final String PREFIX_MSG = "wpp:msg:"; // dedup mensagens TTL 5min
+
+    // -------------------------------------------------------------------------
+    // GET /webhook  (verificação exigida pela Meta ao cadastrar o webhook)
+    // -------------------------------------------------------------------------
     @GetMapping("/webhook")
     public ResponseEntity<String> webhookGet(
+            @RequestParam(value = "hub.mode", required = false) String mode,
+            @RequestParam(value = "hub.verify_token", required = false) String token,
             @RequestParam(value = "hub.challenge", required = false) String challenge) {
-        log.info("Webhook GET chamado");
-        if (challenge != null) {
+
+        if ("subscribe".equals(mode) && verifyToken.equals(token)) {
+            log.info("✅ Webhook verificado com sucesso pela Meta");
             return ResponseEntity.ok(challenge);
         }
-        return ResponseEntity.ok("OK");
+        log.warn("⚠️ Falha na verificação do webhook: token inválido");
+        return ResponseEntity.status(403).body("Forbidden");
     }
 
+    @GetMapping
+    public ResponseEntity<String> base() {
+        return ok();
+    }
+
+    // -------------------------------------------------------------------------
+    // POST /webhook  (mensagens recebidas da Meta)
+    // -------------------------------------------------------------------------
     @PostMapping("/webhook")
+    @SuppressWarnings("unchecked")
     public ResponseEntity<String> webhook(@RequestBody Map<String, Object> payload) {
-        log.info("=== WEBHOOK POST RECEBIDO ===");
-        log.info("Payload: {}", payload);
-
         try {
-            String event = (String) payload.get("event");
-            if (event == null || !event.equals("messages.upsert")) {
-                return ResponseEntity.ok("OK");
-            }
+            List<Map<String, Object>> entries = (List<Map<String, Object>>) payload.get("entry");
+            if (entries == null) return ok();
 
-            @SuppressWarnings("unchecked")
-            Map<String, Object> data = (Map<String, Object>) payload.get("data");
-            if (data == null) return ResponseEntity.ok("OK");
+            for (Map<String, Object> entry : entries) {
+                List<Map<String, Object>> changes = (List<Map<String, Object>>) entry.get("changes");
+                if (changes == null) continue;
 
-            @SuppressWarnings("unchecked")
-            Map<String, Object> message = (Map<String, Object>) data.get("message");
-            @SuppressWarnings("unchecked")
-            Map<String, Object> key = (Map<String, Object>) data.get("key");
+                for (Map<String, Object> change : changes) {
+                    Map<String, Object> value = (Map<String, Object>) change.get("value");
+                    if (value == null) continue;
 
-            if (message == null || key == null) return ResponseEntity.ok("OK");
+                    List<Map<String, Object>> messages = (List<Map<String, Object>>) value.get("messages");
+                    if (messages == null) continue; // pode ser evento de "statuses" (entregue/lido) — ignora
 
-            Boolean fromMe = (Boolean) key.get("fromMe");
-            if (Boolean.TRUE.equals(fromMe)) {
-                log.info("Mensagem enviada por nós mesmos, ignorando");
-                return ResponseEntity.ok("OK");
-            }
+                    List<Map<String, Object>> contacts = (List<Map<String, Object>>) value.get("contacts");
+                    String nomeCliente = extrairNome(contacts);
 
-            // EXTRAI NÚMERO DO CLIENTE COM FALLBACK
-            String telefoneCliente = extrairNumeroCliente(payload, key);
-
-            // SE NÃO CONSEGUIU EXTRAIR, USA NÚMERO DE TESTE
-            if (telefoneCliente == null || telefoneCliente.equals(NUMERO_EMPRESA)) {
-                log.warn("Usando número de teste fallback: {}", NUMERO_CLIENTE_TESTE);
-                telefoneCliente = NUMERO_CLIENTE_TESTE;
-            }
-
-            // Evita duplicação
-            String messageId = (String) key.get("id");
-            if (messageId != null) {
-                String lastId = ultimoMessageId.get(telefoneCliente);
-                if (messageId.equals(lastId)) {
-                    log.info("Mensagem duplicada ignorada");
-                    return ResponseEntity.ok("OK");
+                    for (Map<String, Object> message : messages) {
+                        processarMensagemRecebida(message, nomeCliente);
+                    }
                 }
-                ultimoMessageId.put(telefoneCliente, messageId);
             }
-
-            long agora = System.currentTimeMillis();
-            Long ultimoTempo = ultimaMensagemTempo.get(telefoneCliente);
-            if (ultimoTempo != null && (agora - ultimoTempo) < 3000) {
-                log.info("Mensagem muito rápida, ignorando");
-                return ResponseEntity.ok("OK");
-            }
-            ultimaMensagemTempo.put(telefoneCliente, agora);
-
-            String pushName = (String) data.get("pushName");
-            String nomeCliente = (pushName != null && !pushName.equals(".") && !pushName.isEmpty())
-                    ? pushName : telefoneCliente;
-
-            String texto = extrairTexto(message);
-            if (texto == null || texto.isBlank()) {
-                log.info("Mensagem sem texto, ignorando");
-                return ResponseEntity.ok("OK");
-            }
-
-            log.info("Cliente: {} ({}) - Msg: {}", telefoneCliente, nomeCliente, texto);
-
-            whatsAppMessageService.processarMensagem(telefoneCliente, nomeCliente, texto, "CLIENTE");
-            enviarParaFrontend(telefoneCliente, nomeCliente, texto, "CLIENTE");
-
-            String resposta = botService.processarMensagem(telefoneCliente, nomeCliente, texto);
-
-            if (resposta != null && !"em_atendimento".equals(resposta)) {
-                whatsAppService.enviarMensagem(telefoneCliente, resposta);
-                whatsAppMessageService.processarMensagem(telefoneCliente, "Bot", resposta, "BOT");
-                enviarParaFrontend(telefoneCliente, "Bot", resposta, "BOT");
-            }
-
-            return ResponseEntity.ok("OK");
-
         } catch (Exception e) {
-            log.error("Erro ao processar webhook: {}", e.getMessage(), e);
-            return ResponseEntity.ok("OK");
+            log.error("❌ Erro ao processar webhook: {}", e.getMessage(), e);
+        }
+        return ok();
+    }
+
+    private void processarMensagemRecebida(Map<String, Object> message, String nomeCliente) {
+        String messageId = (String) message.get("id");
+        if (messageId != null && !marcarProcessada(messageId)) {
+            log.debug("Mensagem duplicada ignorada: {}", messageId);
+            return;
+        }
+
+        String telefone = (String) message.get("from");
+        if (telefone == null) return;
+
+        String texto = extrairTexto(message);
+        if (texto == null || texto.isBlank()) return;
+
+        log.info("📨 {} | telefone={} | msg={}", nomeCliente, telefone, texto);
+        processarMensagemCompleta(telefone, nomeCliente, texto);
+    }
+
+    private void processarMensagemCompleta(String telefone, String nomeCliente, String texto) {
+        whatsAppMessageService.processarMensagem(telefone, nomeCliente, texto, "CLIENTE");
+        enviarParaFrontend(telefone, nomeCliente, texto, "CLIENTE");
+
+        String resposta = botService.processarMensagem(telefone, nomeCliente, texto);
+
+        if (resposta != null && !"em_atendimento".equals(resposta)) {
+            whatsAppService.enviarMensagem(telefone, resposta);
+            whatsAppMessageService.processarMensagem(telefone, "Bot", resposta, "BOT");
+            enviarParaFrontend(telefone, "Bot", resposta, "BOT");
         }
     }
 
-    private String extrairNumeroCliente(Map<String, Object> payload, Map<String, Object> key) {
-        // Tenta do sender
-        String sender = (String) payload.get("sender");
-        if (sender != null && sender.contains("@s.whatsapp.net")) {
-            String numero = sender.replace("@s.whatsapp.net", "");
-            if (!numero.equals(NUMERO_EMPRESA) && numero.length() >= 10) {
-                log.info("Número extraído do sender: {}", numero);
-                return numero;
-            }
-        }
-
-        // Tenta do remoteJid
-        String remoteJid = (String) key.get("remoteJid");
-        if (remoteJid != null && remoteJid.contains("@s.whatsapp.net")) {
-            String numero = remoteJid.replace("@s.whatsapp.net", "");
-            if (!numero.equals(NUMERO_EMPRESA) && numero.length() >= 10) {
-                log.info("Número extraído do remoteJid: {}", numero);
-                return numero;
-            }
-        }
-
-        return null;
-    }
-
-    private String extrairTexto(Map<String, Object> message) {
-        if (message.containsKey("conversation")) {
-            return (String) message.get("conversation");
-        }
-        if (message.containsKey("extendedTextMessage")) {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> ext = (Map<String, Object>) message.get("extendedTextMessage");
-            return (String) ext.get("text");
-        }
-        return null;
-    }
-
-    private void enviarParaFrontend(String telefone, String nome, String mensagem, String remetente) {
-        try {
-            Map<String, Object> wsMessage = Map.of(
-                    "telefone", telefone,
-                    "nome", nome,
-                    "mensagem", mensagem,
-                    "remetente", remetente,
-                    "timestamp", System.currentTimeMillis()
-            );
-            messagingTemplate.convertAndSend("/topic/whatsapp-mensagens", wsMessage);
-        } catch (Exception e) {
-            log.error("Erro ao enviar para frontend: {}", e.getMessage());
-        }
-    }
-
+    // -------------------------------------------------------------------------
+    // POST /responder
+    // -------------------------------------------------------------------------
     @PostMapping("/responder")
     public ResponseEntity<String> responderCliente(@RequestBody Map<String, String> req) {
-        String telefone = req.get("telefone");
-        String mensagem = req.get("mensagem");
+        String telefone      = req.get("telefone");
+        String mensagem      = req.get("mensagem");
         String atendenteNome = req.get("atendenteNome");
 
-        log.info("Atendente {} respondendo para: {}", atendenteNome, telefone);
+        if (telefone == null || mensagem == null) {
+            return ResponseEntity.badRequest().body("telefone e mensagem são obrigatórios");
+        }
+
+        log.info("💬 Atendente {} → {}", atendenteNome, telefone);
         whatsAppService.enviarMensagem(telefone, mensagem);
         whatsAppMessageService.processarMensagem(telefone, atendenteNome, mensagem, "ATENDENTE");
         enviarParaFrontend(telefone, atendenteNome, mensagem, "ATENDENTE");
-
-        return ResponseEntity.ok("OK");
-    }
-
-    @GetMapping("/qrcode")
-    public ResponseEntity<String> qrCode() {
-        return ResponseEntity.ok(whatsAppService.gerarQrCode());
-    }
-
-    @PostMapping("/enviar")
-    public ResponseEntity<String> enviar(@RequestBody Map<String, String> req) {
-        String telefone = req.get("telefone");
-        String mensagem = req.get("mensagem");
-        log.info("Enviando mensagem para: {}", telefone);
-        whatsAppService.enviarMensagem(telefone, mensagem);
-        return ResponseEntity.ok("OK");
+        return ok();
     }
 
     @GetMapping("/status")
@@ -214,5 +149,68 @@ public class WhatsAppController {
     @GetMapping("/ping")
     public ResponseEntity<String> ping() {
         return ResponseEntity.ok("pong");
+    }
+
+    // =========================================================================
+    // DEDUPLICAÇÃO VIA REDIS
+    // =========================================================================
+
+    private boolean marcarProcessada(String messageId) {
+        Boolean isNew = redisTemplate.opsForValue()
+                .setIfAbsent(PREFIX_MSG + messageId, "1", Duration.ofMinutes(5));
+        return Boolean.TRUE.equals(isNew);
+    }
+
+    // =========================================================================
+    // HELPERS
+    // =========================================================================
+
+    @SuppressWarnings("unchecked")
+    private String extrairNome(List<Map<String, Object>> contacts) {
+        if (contacts == null || contacts.isEmpty()) return "Cliente";
+        Map<String, Object> profile = (Map<String, Object>) contacts.get(0).get("profile");
+        if (profile == null) return "Cliente";
+        String nome = (String) profile.get("name");
+        return (nome != null && !nome.isBlank()) ? nome : "Cliente";
+    }
+
+    @SuppressWarnings("unchecked")
+    private String extrairTexto(Map<String, Object> message) {
+        String tipo = (String) message.get("type");
+        if (tipo == null) return null;
+
+        if ("text".equals(tipo)) {
+            Map<String, Object> text = (Map<String, Object>) message.get("text");
+            return text != null ? (String) text.get("body") : null;
+        }
+
+        for (String midiaTipo : List.of("image", "video", "document", "audio")) {
+            if (midiaTipo.equals(tipo)) {
+                Map<String, Object> media = (Map<String, Object>) message.get(midiaTipo);
+                String caption = media != null ? (String) media.get("caption") : null;
+                if (caption != null && !caption.isBlank()) return caption;
+                return "[" + midiaTipo.toUpperCase() + "]";
+            }
+        }
+
+        return null;
+    }
+
+    private void enviarParaFrontend(String telefone, String nome, String mensagem, String remetente) {
+        try {
+            messagingTemplate.convertAndSend("/topic/whatsapp-mensagens", Map.of(
+                    "jid",       telefone,
+                    "nome",      nome,
+                    "mensagem",  mensagem,
+                    "remetente", remetente,
+                    "timestamp", System.currentTimeMillis()
+            ));
+        } catch (Exception e) {
+            log.warn("Erro WebSocket frontend: {}", e.getMessage());
+        }
+    }
+
+    private ResponseEntity<String> ok() {
+        return ResponseEntity.ok("OK");
     }
 }

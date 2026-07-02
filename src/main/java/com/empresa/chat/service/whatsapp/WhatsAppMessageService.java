@@ -18,6 +18,8 @@ import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -34,8 +36,8 @@ public class WhatsAppMessageService {
     private final SimpMessagingTemplate messagingTemplate;
 
     @Transactional
-    public void processarMensagem(String telefone, String nome, String mensagem, String remetente) {
-        Conversa conversa = buscarOuCriarConversa(telefone, nome);
+    public void processarMensagem(String jid, String nome, String mensagem, String remetente) {
+        Conversa conversa = buscarOuCriarConversa(jid, nome);
 
         Mensagem msg = Mensagem.builder()
                 .conversa(conversa)
@@ -44,26 +46,63 @@ public class WhatsAppMessageService {
                 .build();
         mensagemRepository.save(msg);
 
-        conversa.setUpdatedAt(java.time.LocalDateTime.now());
+        // Usa o @PreUpdate da entidade — basta salvar
         conversaRepository.save(conversa);
 
-        if (remetente.equals("CLIENTE")) {
-            notificarFrontendTicket(conversa, nome, telefone, mensagem);
+        if ("CLIENTE".equals(remetente)) {
+            notificarFrontend(conversa, nome, jid, mensagem);
         }
     }
 
-    private Conversa buscarOuCriarConversa(String telefone, String nome) {
-        Optional<Conversa> conversaOpt = conversaRepository.findAll().stream()
-                .filter(c -> telefone.equals(c.getClienteTel()) &&
-                        c.getStatus() != StatusConversa.ENCERRADA)
-                .findFirst();
+    /**
+     * Migra conversas criadas com LID temporário para o JID real.
+     * Chamado quando o contacts.upsert resolve o mapeamento LID→JID.
+     *
+     * Atualiza clienteTel de todas as conversas não encerradas que ainda
+     * usam o LID como identificador, para que as próximas mensagens do
+     * cliente (que já chegam pelo JID real) sejam associadas à mesma conversa.
+     */
+    @Transactional
+    public void migrarClienteTel(String lidAntigo, String jidNovo) {
+        List<Conversa> conversas = conversaRepository.findByClienteTelAndStatus(
+                lidAntigo, StatusConversa.AGUARDANDO);
 
-        if (conversaOpt.isPresent()) {
-            return conversaOpt.get();
+        // Inclui conversas EM_ATENDIMENTO também
+        List<Conversa> emAtendimento = conversaRepository.findByClienteTelAndStatus(
+                lidAntigo, StatusConversa.EM_ATENDIMENTO);
+
+        conversas.addAll(emAtendimento);
+
+        if (conversas.isEmpty()) {
+            log.debug("Nenhuma conversa ativa com LID {} para migrar", lidAntigo);
+            return;
         }
 
-        // Busca um setor padrão (ex: "Geral" ou o primeiro disponível)
-        Setor setorPadrao = setorRepository.findByAtivoTrue().stream().findFirst()
+        for (Conversa c : conversas) {
+            c.setClienteTel(jidNovo);
+            conversaRepository.save(c);
+            log.info("🔄 Conversa {} migrada: {} → {}", c.getProtocolo(), lidAntigo, jidNovo);
+        }
+    }
+
+    private Conversa buscarOuCriarConversa(String jid, String nome) {
+        // Busca direta por JID — sem findAll()
+        Optional<Conversa> existente = conversaRepository
+                .findByClienteTelAndStatusNot(jid, StatusConversa.ENCERRADA);
+
+        if (existente.isPresent()) {
+            Conversa c = existente.get();
+            // Atualiza nome se estava genérico
+            if ("Cliente".equals(c.getClienteNome()) && nome != null && !nome.equals("Cliente")) {
+                c.setClienteNome(nome);
+                conversaRepository.save(c);
+            }
+            return c;
+        }
+
+        // Cria nova conversa
+        Setor setorPadrao = setorRepository.findByAtivoTrue().stream()
+                .findFirst()
                 .orElseThrow(() -> new RuntimeException("Nenhum setor ativo encontrado"));
 
         String protocolo = "CHAT-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
@@ -72,7 +111,7 @@ public class WhatsAppMessageService {
                 .protocolo(protocolo)
                 .canal(CanalOrigem.WHATSAPP)
                 .clienteNome(nome)
-                .clienteTel(telefone)
+                .clienteTel(jid)
                 .setor(setorPadrao)
                 .status(StatusConversa.AGUARDANDO)
                 .build();
@@ -85,41 +124,38 @@ public class WhatsAppMessageService {
                 .build();
         ticket = ticketRepository.save(ticket);
 
-        log.info("Nova conversa criada: {} - {} com setor: {}", nome, telefone, setorPadrao.getNome());
+        log.info("📋 Nova conversa: protocolo={} | cliente={} | jid={}", protocolo, nome, jid);
 
-        Map<String, Object> ticketMsg = Map.of(
-                "id", ticket.getId(),
-                "protocolo", conversa.getProtocolo(),
+        messagingTemplate.convertAndSend("/topic/fila", Map.of(
+                "id",          ticket.getId(),
+                "protocolo",   conversa.getProtocolo(),
                 "clienteNome", nome,
-                "clienteTel", telefone,
-                "setor", setorPadrao.getNome(),
-                "status", "ABERTO",
-                "timestamp", System.currentTimeMillis()
-        );
-        messagingTemplate.convertAndSend("/topic/fila", ticketMsg);
+                "clienteTel",  jid,
+                "setor",       setorPadrao.getNome(),
+                "status",      "ABERTO",
+                "timestamp",   System.currentTimeMillis()
+        ));
 
         return conversa;
     }
 
-    private void notificarFrontendTicket(Conversa conversa, String nome, String telefone, String mensagem) {
-        Map<String, Object> ticketMsg = Map.of(
-                "id", conversa.getId(),
-                "protocolo", conversa.getProtocolo(),
-                "clienteNome", nome,
-                "clienteTel", telefone,
+    private void notificarFrontend(Conversa conversa, String nome, String jid, String mensagem) {
+        messagingTemplate.convertAndSend("/topic/fila", Map.of(
+                "id",             conversa.getId(),
+                "protocolo",      conversa.getProtocolo(),
+                "clienteNome",    nome,
+                "clienteTel",     jid,
                 "ultimaMensagem", mensagem,
-                "status", conversa.getStatus().toString(),
-                "timestamp", System.currentTimeMillis()
-        );
-        messagingTemplate.convertAndSend("/topic/fila", ticketMsg);
+                "status",         conversa.getStatus().toString(),
+                "timestamp",      System.currentTimeMillis()
+        ));
     }
 
     private RemetenteTipo converterRemetente(String remetente) {
-        switch (remetente) {
-            case "CLIENTE": return RemetenteTipo.CLIENTE;
-            case "ATENDENTE": return RemetenteTipo.ATENDENTE;
-            case "BOT": return RemetenteTipo.BOT;
-            default: return RemetenteTipo.CLIENTE;
-        }
+        return switch (remetente) {
+            case "ATENDENTE" -> RemetenteTipo.ATENDENTE;
+            case "BOT"       -> RemetenteTipo.BOT;
+            default          -> RemetenteTipo.CLIENTE;
+        };
     }
 }
