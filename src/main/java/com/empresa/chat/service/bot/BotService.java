@@ -41,7 +41,6 @@ public class BotService {
     // Estado do fluxo do bot por cliente (TTL 1 hora de inatividade)
     private static final String PREFIX_ETAPA        = "bot:etapa:";
     private static final String PREFIX_SETOR        = "bot:setor:";
-    private static final String PREFIX_ULTIMA_MSG   = "bot:ultimamsg:";
     private static final String PREFIX_FINALIZADO   = "bot:finalizado:";
 
     private static final Duration TTL_SESSAO        = Duration.ofHours(1);
@@ -55,6 +54,11 @@ public class BotService {
      * Processa a mensagem do cliente e retorna a resposta do bot,
      * ou "em_atendimento" se o cliente já foi encaminhado para um atendente,
      * ou null se a mensagem deve ser ignorada.
+     *
+     * Nota: a deduplicação de mensagens repetidas (reentrega do webhook da Meta)
+     * já é feita no WhatsAppController usando o ID único da mensagem — não
+     * duplicamos essa lógica aqui, pois comparar apenas o texto bloquearia
+     * respostas legítimas do cliente repetindo a mesma palavra/opção.
      */
     public String processarMensagem(String jid, String nome, String mensagem) {
 
@@ -65,14 +69,6 @@ public class BotService {
         }
 
         String msgLower = mensagem.toLowerCase().trim();
-
-        // Deduplicação: evita processar a mesma mensagem duas vezes seguidas
-        String ultimaMsg = redisTemplate.opsForValue().get(PREFIX_ULTIMA_MSG + jid);
-        if (mensagem.equals(ultimaMsg)) {
-            log.debug("Mensagem repetida ignorada para {}", jid);
-            return null;
-        }
-        redisTemplate.opsForValue().set(PREFIX_ULTIMA_MSG + jid, mensagem, TTL_SESSAO);
 
         int etapa = getEtapa(jid);
         log.info("🤖 Bot | jid={} | etapa={} | msg={}", jid, etapa, mensagem);
@@ -287,9 +283,8 @@ public class BotService {
 
     private void resetar(String jid) {
         redisTemplate.delete(List.of(
-                PREFIX_ETAPA      + jid,
-                PREFIX_SETOR      + jid,
-                PREFIX_ULTIMA_MSG + jid
+                PREFIX_ETAPA + jid,
+                PREFIX_SETOR + jid
         ));
     }
 
