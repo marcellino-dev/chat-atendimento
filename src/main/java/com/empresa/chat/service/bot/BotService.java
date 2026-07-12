@@ -1,18 +1,28 @@
 package com.empresa.chat.service.bot;
 
 import com.empresa.chat.domain.enums.StatusAtendente;
+import com.empresa.chat.domain.enums.StatusConversa;
+import com.empresa.chat.domain.enums.StatusTicket;
 import com.empresa.chat.domain.model.Atendente;
+import com.empresa.chat.domain.model.Conversa;
 import com.empresa.chat.domain.model.Setor;
+import com.empresa.chat.domain.model.Ticket;
 import com.empresa.chat.repository.AtendenteRepository;
+import com.empresa.chat.repository.ConversaRepository;
 import com.empresa.chat.repository.SetorRepository;
+import com.empresa.chat.repository.TicketRepository;
 import com.empresa.chat.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
@@ -22,6 +32,9 @@ public class BotService {
     private final AtendenteRepository atendenteRepository;
     private final SetorRepository setorRepository;
     private final UserRepository userRepository;
+    private final ConversaRepository conversaRepository;
+    private final TicketRepository ticketRepository;
+    private final SimpMessagingTemplate messagingTemplate;
     private final StringRedisTemplate redisTemplate;
 
     // ── Prefixos Redis ──────────────────────────────────────────────────────
@@ -145,6 +158,13 @@ public class BotService {
         Setor setor = setorRepository.findById(setorId).orElse(null);
         String nomeSetor = setor != null ? setor.getNome() : "";
 
+        // Aplica de fato a escolha no Ticket/Conversa (antes só existia na resposta do bot)
+        boolean transferido = transferirParaAtendente(jid, setor, atendente);
+
+        if (!transferido) {
+            log.warn("⚠️ Não foi possível localizar conversa/ticket ativo para transferir: jid={}", jid);
+        }
+
         // Marca atendimento finalizado (bot para de responder)
         redisTemplate.opsForValue().set(PREFIX_FINALIZADO + jid, "true", TTL_FINALIZADO);
         resetar(jid);
@@ -154,6 +174,61 @@ public class BotService {
         return "✅ Você será atendido por *" + nomeAtendente + "* do setor *" + nomeSetor + "*.\n\n"
                 + "⏳ Aguarde, o atendente irá responder em breve.\n\n"
                 + "Digite *MENU* a qualquer momento para reiniciar.";
+    }
+
+    // =========================================================================
+    // TRANSFERÊNCIA REAL (Ticket + Conversa) — corrige o gap entre bot e banco
+    // =========================================================================
+
+    /**
+     * Atualiza a Conversa e o Ticket ativos do cliente para refletir a escolha
+     * feita no fluxo do bot: setor correto, atendente atribuído diretamente,
+     * e status já como EM_ATENDIMENTO (pula a fila, pois o cliente escolheu
+     * explicitamente o atendente).
+     */
+    @Transactional
+    private boolean transferirParaAtendente(String jid, Setor setor, Atendente atendente) {
+        if (setor == null) return false;
+
+        Conversa conversa = conversaRepository
+                .findByClienteTelAndStatusNot(jid, StatusConversa.ENCERRADA)
+                .orElse(null);
+
+        if (conversa == null) return false;
+
+        conversa.setSetor(setor);
+        conversa.setAtendente(atendente);
+        conversa.setStatus(StatusConversa.EM_ATENDIMENTO);
+        conversaRepository.save(conversa);
+
+        ticketRepository.findByConversaId(conversa.getId()).ifPresent(ticket -> {
+            ticket.setSetor(setor);
+            ticket.setAtendente(atendente);
+            ticket.setStatus(StatusTicket.EM_ATENDIMENTO);
+            ticket.setAssumidoAt(LocalDateTime.now());
+            ticketRepository.save(ticket);
+
+            notificarTransferencia(ticket, conversa, atendente, setor);
+        });
+
+        return true;
+    }
+
+    private void notificarTransferencia(Ticket ticket, Conversa conversa, Atendente atendente, Setor setor) {
+        try {
+            messagingTemplate.convertAndSend("/topic/fila", Map.of(
+                    "id",             ticket.getId(),
+                    "protocolo",      conversa.getProtocolo(),
+                    "clienteNome",    conversa.getClienteNome(),
+                    "clienteTel",     conversa.getClienteTel(),
+                    "setor",          setor.getNome(),
+                    "atendenteId",    atendente.getId(),
+                    "status",         "EM_ATENDIMENTO",
+                    "timestamp",      System.currentTimeMillis()
+            ));
+        } catch (Exception e) {
+            log.warn("Erro ao notificar frontend sobre transferência: {}", e.getMessage());
+        }
     }
 
     // =========================================================================
